@@ -41,10 +41,10 @@ def read_instances_from_file(inst_file, max_sent_len, keep_case):
             vn = normalizeStringvn(sent)
             words = list(nonvn)
             vnwords = list(vn)
-            if len(words) > max_sent_len:
-                trimmed_sent_count += 1
-            word_inst = words[:max_sent_len]
-            vnword_inst = words[:max_sent_len]
+            # if len(words) > max_sent_len:
+            #     trimmed_sent_count += 1
+            word_inst = words
+            vnword_inst = vnwords
             if word_inst:
                 # word_insts += [[Constants.BOS_WORD] + word_inst + [Constants.EOS_WORD]]
                 train_word_insts += [[Constants.BOS_WORD] + word_inst + [Constants.EOS_WORD]]
