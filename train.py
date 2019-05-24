@@ -5,6 +5,7 @@ This script handling the training process.
 import argparse
 import math
 import time
+import os
 
 from tqdm import tqdm
 import torch
@@ -12,15 +13,20 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data
 import transformer.Constants as Constants
-from dataset import TranslationDataset, paired_collate_fn
+from datasets.dataset import paired_collate_fn
 from transformer.Models import Transformer
 from transformer.Optim import ScheduledOptim
+import transformer.Constants as Constants
+from util import generate_mistake
+from glob import glob
+from datasets import dataset
+
 
 def cal_performance(pred, gold, smoothing=False):
     ''' Apply label smoothing if needed '''
 
     loss = cal_loss(pred, gold, smoothing)
- 
+
     pred = pred.max(1)[1]
     gold = gold.contiguous().view(-1)
     non_pad_mask = gold.ne(Constants.PAD)
@@ -60,15 +66,14 @@ def train_epoch(model, training_data, optimizer, device, smoothing):
     total_loss = 0
     n_word_total = 0
     n_word_correct = 0
-
     for batch in tqdm(
             training_data, mininterval=2,
             desc='  - (Training)   ', leave=False):
 
         # prepare data
         src_seq, src_pos, tgt_seq, tgt_pos = map(lambda x: x.to(device), batch)
-        gold = tgt_seq[:, 1:]
 
+        gold = tgt_seq[:, 1:]
         # forward
         optimizer.zero_grad()
         pred = model(src_seq, src_pos, tgt_seq, tgt_pos)
@@ -146,7 +151,6 @@ def train(model, training_data, validation_data, optimizer, device, opt):
     valid_accus = []
     for epoch_i in range(opt.epoch):
         print('[ Epoch', epoch_i, ']')
-
         start = time.time()
         train_loss, train_accu = train_epoch(
             model, training_data, optimizer, device, smoothing=opt.label_smoothing)
@@ -193,42 +197,80 @@ def main():
     ''' Main function '''
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('-data', required=True)
+    parser.add_argument('--train_src', required=True)
+    parser.add_argument('--valid_src', required=True)
+    parser.add_argument('--max_word_seq_len', type=int, default=100)
+    parser.add_argument('--min_word_count', type=int, default=5)
+    parser.add_argument('--keep_case', action='store_true')
 
-    parser.add_argument('-epoch', type=int, default=500)
-    parser.add_argument('-batch_size', type=int, default=64)
+    parser.add_argument('--epoch', type=int, default=500)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--num_worker', type=int, default=8)
 
-    #parser.add_argument('-d_word_vec', type=int, default=512)
-    parser.add_argument('-d_model', type=int, default=512)
-    parser.add_argument('-d_inner_hid', type=int, default=2048)
-    parser.add_argument('-d_k', type=int, default=64)
-    parser.add_argument('-d_v', type=int, default=64)
+    # parser.add_argument('-d_word_vec', type=int, default=512)
+    parser.add_argument('--d_model', type=int, default=512)
+    parser.add_argument('--d_inner_hid', type=int, default=2048)
+    parser.add_argument('--d_k', type=int, default=64)
+    parser.add_argument('--d_v', type=int, default=64)
 
-    parser.add_argument('-n_head', type=int, default=8)
-    parser.add_argument('-n_layers', type=int, default=6)
-    parser.add_argument('-n_warmup_steps', type=int, default=4000)
+    parser.add_argument('--n_head', type=int, default=8)
+    parser.add_argument('--n_layers', type=int, default=6)
+    parser.add_argument('--n_warmup_steps', type=int, default=4000)
 
-    parser.add_argument('-dropout', type=float, default=0.1)
-    parser.add_argument('-embs_share_weight', action='store_true')
-    parser.add_argument('-proj_share_weight', action='store_true')
+    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--embs_share_weight', action='store_true')
+    parser.add_argument('--proj_share_weight', action='store_true')
 
-    parser.add_argument('-log', default=None)
-    parser.add_argument('-save_model', default=None)
-    parser.add_argument('-save_mode', type=str, choices=['all', 'best'], default='best')
+    parser.add_argument('--model', default=None, help='Path to model file')
+    parser.add_argument('--log', default=None)
+    parser.add_argument('--save_model', default=None)
+    parser.add_argument('--save_data', default='./data/word2idx.pth')
+    parser.add_argument('--save_mode', type=str, choices=['all', 'best'], default='best')
 
-    parser.add_argument('-no_cuda', action='store_true')
-    parser.add_argument('-label_smoothing', action='store_true')
+    parser.add_argument('--no_cuda', action='store_true')
+    parser.add_argument('--label_smoothing', action='store_true')
 
     opt = parser.parse_args()
     opt.cuda = not opt.no_cuda
     opt.d_word_vec = opt.d_model
 
+    opt.max_token_seq_len = opt.max_word_seq_len + 2
     #========= Loading Dataset =========#
-    data = torch.load(opt.data)
-    opt.max_token_seq_len = data['settings'].max_token_seq_len
-
-    training_data, validation_data = prepare_dataloaders(data, opt)
-
+    training_data = torch.utils.data.DataLoader(
+        dataset.TranslationDataset(
+            dir_name=opt.train_src,
+            max_word_seq_len= opt.max_word_seq_len,
+            min_word_count=opt.min_word_count,
+            keep_case=opt.keep_case,
+            src_word2idx=None,
+            tgt_word2idx=None
+            ),
+        num_workers=opt.num_worker,
+        batch_size=opt.batch_size,
+        collate_fn=paired_collate_fn,
+        shuffle=True)
+    validation_data = torch.utils.data.DataLoader(
+        dataset.TranslationDataset(
+            dir_name=opt.valid_src,
+            max_word_seq_len= opt.max_word_seq_len,
+            min_word_count=opt.min_word_count,
+            keep_case=opt.keep_case,
+            src_word2idx=training_data.dataset.src_word2idx,
+            tgt_word2idx=training_data.dataset.tgt_word2idx
+            ),
+        num_workers=opt.num_worker,
+        batch_size=opt.batch_size,
+        collate_fn=paired_collate_fn,
+        shuffle=True)
+    data = {
+        'dict': {
+            'src': training_data.dataset.src_word2idx,
+            'tgt': training_data.dataset.tgt_word2idx}
+        }
+    print('[Info] Dumping the processed data to pickle file', opt.save_data)
+    torch.save(data, opt.save_data)
+    print('[Info] Finish.')
+    del data
     opt.src_vocab_size = training_data.dataset.src_vocab_size
     opt.tgt_vocab_size = training_data.dataset.tgt_vocab_size
 
@@ -260,33 +302,30 @@ def main():
             filter(lambda x: x.requires_grad, transformer.parameters()),
             betas=(0.9, 0.98), eps=1e-09),
         opt.d_model, opt.n_warmup_steps)
+    if(opt.model is not None):
+        print('pretrain model!')
+        checkpoint = torch.load(opt.model)
+        model_opt = checkpoint['settings']
+        transformer = Transformer(
+            model_opt.src_vocab_size,
+            model_opt.tgt_vocab_size,
+            model_opt.max_token_seq_len,
+            tgt_emb_prj_weight_sharing=model_opt.proj_share_weight,
+            emb_src_tgt_weight_sharing=model_opt.embs_share_weight,
+            d_k=model_opt.d_k,
+            d_v=model_opt.d_v,
+            d_model=model_opt.d_model,
+            d_word_vec=model_opt.d_word_vec,
+            d_inner=model_opt.d_inner_hid,
+            n_layers=model_opt.n_layers,
+            n_head=model_opt.n_head,
+            dropout=model_opt.dropout)
+        transformer.load_state_dict(checkpoint['model'])
+        transformer = transformer.to(device)
 
     train(transformer, training_data, validation_data, optimizer, device ,opt)
 
 
-def prepare_dataloaders(data, opt):
-    # ========= Preparing DataLoader =========#
-    train_loader = torch.utils.data.DataLoader(
-        TranslationDataset(
-            src_word2idx=data['dict']['src'],
-            tgt_word2idx=data['dict']['tgt'],
-            src_insts=data['train']['src'],
-            tgt_insts=data['train']['tgt']),
-        num_workers=8,
-        batch_size=opt.batch_size,
-        collate_fn=paired_collate_fn,
-        shuffle=True)
-
-    valid_loader = torch.utils.data.DataLoader(
-        TranslationDataset(
-            src_word2idx=data['dict']['src'],
-            tgt_word2idx=data['dict']['tgt'],
-            src_insts=data['valid']['src'],
-            tgt_insts=data['valid']['tgt']),
-        num_workers=2,
-        batch_size=opt.batch_size,
-        collate_fn=paired_collate_fn)
-    return train_loader, valid_loader
 
 
 if __name__ == '__main__':
